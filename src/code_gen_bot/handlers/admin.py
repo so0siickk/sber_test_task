@@ -1,7 +1,8 @@
 import datetime
+import html
 from pathlib import Path
 
-from aiogram import Bot, Router, types
+from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 from loguru import logger
@@ -14,60 +15,64 @@ admin_router = Router()
 admin_router.message.filter(lambda message: message.from_user.id in settings.admin_ids)
 
 
-async def process_and_send_new_poll(bot: Bot, chat_id: int, repo: Repo, llm_client: LLMClient):
+async def process_and_send_new_poll(message: types.Message, repo: Repo, llm_client: LLMClient):
     """Общая логика: получить контекст, сгенерировать варианты, отправить опрос."""
     try:
-        code_context = await repo.get_full_code(chat_id)
-
+        code_context = await repo.get_full_code(message.chat.id)
         options = await llm_client.generate_code_options(context=code_context)
 
-        poll_message = await bot.send_poll(
-            chat_id=chat_id,
+        options_to_send = options[:4]
+
+        poll_message = await message.bot.send_poll(
+            chat_id=message.chat.id,
             question="Выберите следующую строку кода",
-            options=options,
+            options=options_to_send,
             is_anonymous=False,
             allows_multiple_answers=False,
         )
-        await repo.set_active_poll(chat_id=chat_id, message_id=poll_message.message_id, poll_id=poll_message.poll.id)
+        await repo.set_active_poll(
+            chat_id=message.chat.id, message_id=poll_message.message_id, poll_id=poll_message.poll.id
+        )
     except LLMError as e:
-        logger.error(f"LLM error for chat {chat_id}: {e}")
-        await bot.send_message(chat_id, f"Не удалось сгенерировать варианты: {e}")
+        logger.error(f"LLM error for chat {message.chat.id}: {e}")
+        await message.answer(
+            "Не удалось сгенерировать варианты после нескольких попыток.\n"
+            "Пожалуйста, попробуйте выполнить команду еще раз."
+        )
 
 
 @admin_router.message(Command("start"))
-async def cmd_start(message: types.Message, repo: Repo, llm_client: LLMClient, bot: Bot):
+async def cmd_start(message: types.Message, repo: Repo, llm_client: LLMClient):
     await message.answer(
         f"Привет, админ {message.from_user.full_name}!\nИстория этого чата очищена. Генерирую первый опрос..."
     )
     await repo.clear_chat_history(chat_id=message.chat.id)
-    await process_and_send_new_poll(bot, message.chat.id, repo, llm_client)
+    await process_and_send_new_poll(message, repo, llm_client)
 
 
 @admin_router.message(Command("next"))
-async def cmd_next(message: types.Message, repo: Repo, llm_client: LLMClient, bot: Bot):
-    """Завершает текущий опрос, сохраняет результат и начинает новый."""
+async def cmd_next(message: types.Message, repo: Repo, llm_client: LLMClient):
     active_poll = await repo.get_active_poll(chat_id=message.chat.id)
     if not active_poll:
         await message.answer("Нет активных опросов. Начните с команды /start")
         return
 
     try:
-        final_poll = await bot.stop_poll(chat_id=active_poll.chat_id, message_id=active_poll.message_id)
+        final_poll = await message.bot.stop_poll(chat_id=active_poll.chat_id, message_id=active_poll.message_id)
     except Exception as e:
-        logger.error(f"Could not stop poll for chat {message.chat.id}: {e}")
-        await message.answer("Не удалось остановить опрос. Возможно, он уже закрыт. Начинаю новый.")
-        await process_and_send_new_poll(bot, message.chat.id, repo, llm_client)
+        logger.warning(f"Could not stop poll (it might be already closed): {e}")
+        await process_and_send_new_poll(message, repo, llm_client)
         return
 
     winner = max(final_poll.options, key=lambda opt: opt.voter_count, default=None)
 
     if winner and winner.voter_count > 0:
-        await message.answer(f"Принято! Победившая строка:\n<pre>{winner.text}</pre>")
+        await message.answer(f"Принято! Победившая строка:\n<pre>{html.escape(winner.text)}</pre>")
         await repo.add_code_line(chat_id=message.chat.id, line_text=winner.text)
     else:
         await message.answer("Никто не проголосовал. Пропускаем строку.")
 
-    await process_and_send_new_poll(bot, message.chat.id, repo, llm_client)
+    await process_and_send_new_poll(message, repo, llm_client)
 
 
 @admin_router.message(Command("code_completed"))

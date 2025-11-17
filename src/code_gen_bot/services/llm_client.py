@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from typing import Protocol
 
 import aiohttp
@@ -25,42 +26,73 @@ class OpenAIClient:
     Реализация клиента для OpenAI-совместимых API (OpenAI, Groq, etc.).
     """
 
-    def __init__(self, api_key: str, api_base: str):
+    def __init__(self, api_key: str, api_base: str, model_name: str, timeout: int, retries: int):
         self.api_key = api_key
         self.api_base = api_base
+        self.model_name = model_name
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.retries = retries
         self.prompt_template = (
             "You are a Python code generation assistant. "
-            "Given the existing code context, generate 4 syntactically correct and logical options for the VERY"
-            " NEXT line of code. "
+            "Given the existing code context, generate 4 syntactically correct and logical options for the VERY NEXT"
+            " line of code. "
             "Each option must be a single line, no longer than 95 characters. "
             "Do not add any comments or explanations. "
-            "Return the response as a JSON array of strings.\n\n"
-            "Existing code context:\n"
-            "```python\n{context}\n```\n\n"
-            "Provide 4 options for the next line of code:"
+            'Return the response as a valid JSON array of 4 strings. Example: ["line 1", "line 2", "line 3", "line 4"]'
         )
+
+    def _extract_json_from_response(self, text: str) -> str:
+        match = re.search(r"```json\s*(\[.*?\])\s*```", text, re.DOTALL)
+        if match:
+            logger.info("Found JSON inside a markdown block.")
+            return match.group(1)
+        match = re.search(r"(\[.*\])", text, re.DOTALL)
+        if match:
+            logger.info("Found a raw JSON array in the text.")
+            return match.group(1)
+        logger.warning("Could not find any JSON array in the LLM response.")
+        return text
 
     async def generate_code_options(self, context: str) -> list[str]:
         prompt = self.prompt_template.format(context=context or "# No code yet.")
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        payload = {
-            "model": "llama3-8b-8192",  # Модель от Groq, как самый быстрый вариант
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(f"{self.api_base}/chat/completions", headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"LLM API request failed with status {resp.status}: {error_text}")
-                        raise LLMError(f"API request failed: {error_text}")
-                    response_data = await resp.json()
-                    content_str = response_data["choices"][0]["message"]["content"]
-                    return json.loads(content_str)
-        except (aiohttp.ClientError, json.JSONDecodeError, KeyError, IndexError) as e:
-            logger.exception("An error occurred during LLM request")
-            raise LLMError(f"Failed to process LLM response: {e}") from e
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        payload = {"model": self.model_name, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7}
+        url = f"{self.api_base}/chat/completions"
+
+        last_error = None
+        for attempt in range(self.retries):
+            try:
+                logger.info(f"Sending LLM request (Attempt {attempt + 1}/{self.retries})...")
+                async with aiohttp.ClientSession(timeout=self.timeout, trust_env=False) as session:
+                    async with session.post(url, headers=headers, json=payload) as resp:
+                        if resp.status != 200:
+                            error_text = await resp.text()
+                            raise LLMError(f"API replied with status {resp.status}: {error_text}")
+
+                        response_data = await resp.json()
+                        content_str = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                        if not content_str:
+                            raise LLMError("API returned an empty response.")
+
+                        json_str = self._extract_json_from_response(content_str)
+                        options = json.loads(json_str)
+
+                        if not isinstance(options, list) or len(options) < 2:
+                            raise LLMError(
+                                f"LLM returned only {len(options) if isinstance(options, list) else 0} options."
+                            )
+
+                        return options
+
+            except (LLMError, json.JSONDecodeError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                last_error = e
+                logger.warning(f"LLM request failed on attempt {attempt + 1}. Error: {e}")
+                if attempt < self.retries - 1:
+                    await asyncio.sleep(1)
+
+        logger.error("All LLM request attempts failed.")
+        raise LLMError("All API request attempts failed.") from last_error
 
 
 class MockLLMClient:
@@ -76,12 +108,12 @@ class MockLLMClient:
         self.options = ["import os", "import sys", "from typing import List", "print('Hello, world!')"]
 
     async def generate_code_options(self, context: str) -> list[str]:
-        await asyncio.sleep(1)  # Имитация сетевой задержки
+        await asyncio.sleep(1)
         logger.info(f"MockLLMClient: Faking generation for context:\n---\n{context or 'Empty context'}\n---")
         return self.options
 
     async def finalize_code(self, context: str) -> str:
-        await asyncio.sleep(1)  # Имитация работы
+        await asyncio.sleep(1)
         logger.info("MockLLMClient: Faking code finalization.")
 
         final_code = (
